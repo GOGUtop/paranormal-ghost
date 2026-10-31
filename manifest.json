@@ -1,12 +1,12 @@
 {
-  "name": "保存到 Card（SillyTavern 角色卡 v1.5）",
-  "description": "按 SillyTavern V1/V2/V3 讀取 ccv3/chara Base64 JSON，保留原始 PNG，再透過既有 CardVault API 上傳；Discord 圖片來源尚需實機確認。",
+  "name": "保存到 Card（圖片來源修正版 v1.6）",
+  "description": "圖片選單新增「在瀏覽器中開啟」連結攔截來源路徑；取得原始 PNG 後依 SillyTavern ccv3/chara 規則驗證並上傳 CardVault。需真機驗證。",
   "authors": [
     {
       "name": "CardVault integration"
     }
   ],
   "main": "index.js",
-  "version": "1.5.0",
-  "hash": "51ba78c73873b6b9fbcaa89c776cd222bc23854b"
+  "version": "1.6.0",
+  "hash": "a5dfe3b3b5e40cbf1438d25f3ccc5bf951ad1414"
 }

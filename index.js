@@ -8,6 +8,7 @@
     viewerTrackingAt: 0, jsxSourcesSeen: 0, started: false, sheetHook: false, viewerHooks: [], jsxHooks: [], jsxCalls: 0, jsxMenuMatches: 0, lazyCalls: 0, sheets: 0, menuMatches: 0,
     renderMediaHooks: [], renderMediaCalls: 0, renderMediaURLs: 0, renderMediaAmbiguous: false, mediaType: '', sourceReason: '',
     injections: 0, clicks: 0, uploads: 0, contextUrl: '', contextAt: 0, renderMediaURL: '', viewerSources: [],
+    browserAttempts: 0, browserCaptures: 0, browserHookNames: [], browserReason: '', lastSourcePath: '',
     last: '尚未啟動', error: '', lastUpload: ''
   };
   const cleanups = [];
@@ -80,6 +81,115 @@
     } else if(p.children) return originalAction(p.children,depth+1);
     return null;
   };
+  // Browser-link extraction: the image popup already includes a native
+  // "Open in Browser" action whose closure knows the media URL. Rather than
+  // guessing message attachments or opening an external browser, temporarily
+  // intercept the URL-opening bridge while invoking *that menu item*.
+  // Never call it unless at least one URL bridge is intercepted.
+  const browserOpenerModules = () => {
+    const found=[], seen=new Set();
+    const register=(obj,method,label)=>{
+      if(!obj || typeof obj[method]!=='function')return;
+      if(seen.has(obj)){
+        if(found.some(entry=>entry.obj===obj&&entry.method===method))return;
+      }
+      seen.add(obj);found.push({obj,method,label});
+    };
+    const common=v.metro?.common||{};
+    register(common.ReactNative?.Linking,'openURL','ReactNative.Linking.openURL');
+    register(common.url,'openURL','common.url.openURL');
+    register(common.url,'openExternalURL','common.url.openExternalURL');
+    register(common.url,'openInBrowser','common.url.openInBrowser');
+    const lookups=[
+      ['openURL'],['openExternalURL'],['openExternalLink'],['openInBrowser'],
+      ['openLink'],['openExternalBrowser'],['openMediaInBrowser']
+    ];
+    for(const keys of lookups){
+      try {
+        const mod=v.metro?.findByProps?.(...keys);
+        for(const key of keys)register(mod,key,'metro.'+key);
+      }catch(_){}
+    }
+    return found;
+  };
+  const captureFromBrowserAction = nativeBrowser => {
+    if (!nativeBrowser || typeof nativeBrowser.fn!=='function') {
+      state.browserReason='圖片選單沒有可呼叫的「在瀏覽器中開啟」動作';
+      return Promise.resolve('');
+    }
+    if(typeof v.patcher?.instead!=='function'){
+      state.browserReason='Revenge 未提供 instead 攔截接口';
+      return Promise.resolve('');
+    }
+    state.browserAttempts++;
+    return new Promise(resolve => {
+      let completed=false, timer=null, unknown='';
+      const unpatches=[];
+      const finish=(url,why)=>{
+        if(completed)return;
+        completed=true;
+        if(timer!=null)clearTimeout(timer);
+        while(unpatches.length){try{unpatches.pop()();}catch(_){}}
+        if(why)state.browserReason=why;
+        if(url){state.browserCaptures++;state.lastSourcePath='瀏覽器菜單 URL 攔截';}
+        resolve(url||'');
+      };
+      for(const {obj,method,label} of browserOpenerModules()){
+        try{
+          const unpatch=v.patcher.instead(method,obj,(args,original)=>{
+            // This branch only runs while explicitly handling Card's own tap.
+            // The external browser must not be launched as a side effect.
+            const urls=mediaRecords(args,4);
+            if(urls.length===1){
+              state.sourceReason='「在瀏覽器中開啟」動作';
+              const exact=urls[0].url;
+              Promise.resolve().then(()=>finish(exact,'取得原始附件網址'));
+            } else if(urls.length>1){
+              unknown='「在瀏覽器中開啟」動作包含多張圖片';
+            } else {
+              const a=Array.isArray(args)?args[0]:null;
+              const textUrl=typeof a==='string'?a:(typeof a?.url==='string'?a.url:'');
+              if(textUrl)unknown='開啟網址不是 Discord 原始附件，已阻止跳轉';
+            }
+            // Do NOT invoke original / open a browser. Some bridge callers
+            // await the result; return a resolved promise for compatibility.
+            return Promise.resolve(true);
+          });
+          if(typeof unpatch==='function'){
+            unpatches.push(unpatch);
+            if(!state.browserHookNames.includes(label))state.browserHookNames.push(label);
+          }
+        }catch(e){reportError(e);}
+      }
+      if(unpatches.length===0){
+        finish('','無法攔截 Discord 的網址開啟方法；未觸發瀏覽器動作');
+        return;
+      }
+      try{
+        const result=nativeBrowser.fn.call(nativeBrowser.receiver);
+        if(result&&typeof result.catch==='function')result.catch(e=>{
+          reportError(e);finish('','原生「在瀏覽器中開啟」動作執行失敗');
+        });
+      }catch(e){reportError(e);finish('','原生「在瀏覽器中開啟」動作拋出錯誤');return;}
+      timer=setTimeout(()=>finish('',unknown||'瀏覽器動作沒有提供 Discord 附件網址'),2200);
+    });
+  };
+  const uploadWithFallbacks = async (context, nativeSave, nativeBrowser) => {
+    // A URL from this exact popup is unambiguous. Cached viewer URLs may
+    // survive scrolling to another image, so prefer the browser menu action
+    // over cached media-viewer state when the popup lacks its own attachment.
+    const exact=mediaRecords(context,5);
+    if(exact.length===1){state.lastSourcePath='目前圖片選單';return downloadAndUpload(exact[0].url);}
+    if(exact.length>1){state.sourceReason='選單包含多個媒體來源，禁止猜測';return downloadAndUpload('');}
+    toast('正在從圖片選單取得目前附件來源…');
+    const fromBrowser=await captureFromBrowserAction(nativeBrowser);
+    if(fromBrowser)return downloadAndUpload(fromBrowser);
+    const direct=currentURL(context);
+    if(direct){state.lastSourcePath='圖片檢視器快取';return downloadAndUpload(direct);}
+    // Existing download capture remains a last resort. Calling Discord Save
+    // can also save the picture to the gallery; this is disclosed in settings.
+    return uploadFromSaveAction(context,nativeSave);
+  };
   const uploadFromSaveAction = async (context, nativeSave) => {
     const direct=currentURL(context);
     if(direct) return downloadAndUpload(direct);
@@ -95,7 +205,7 @@
       }catch(e){reportError(e);finish();return;}
       setTimeout(finish,1800);
     });
-    if(!url){state.sourceReason='原生保存沒有提供可讀取的媒體地址';return downloadAndUpload('');}
+    if(!url){state.sourceReason='原生保存沒有提供可讀取的媒體地址；'+(state.browserReason||'');return downloadAndUpload('');}
     state.sourceReason='Discord 原生保存攔截';
     return downloadAndUpload(url);
   };
@@ -396,7 +506,9 @@
     // Always display the action in the recognized image menu. Determine URL at press time.
     const original = sheet.options[pos];
     const save = originalAction(original);
-    const item = { label:'保存到 Card', onPress: () => uploadFromSaveAction(sheet,save) };
+    const browserIndex=sheet.options.findIndex(o=>isBrowser(labelsOf(o)));
+    const open=browserIndex>=0?originalAction(sheet.options[browserIndex]):null;
+    const item = { label:'保存到 Card', onPress: () => uploadWithFallbacks(sheet,save,open) };
     if (original && original.icon != null) item.icon = original.icon;
     const options = sheet.options.slice();
     options.splice(pos + 1, 0, item);
@@ -519,7 +631,9 @@
     // First render the action even when image URL isn't available. On click,
     // show the error rather than silently uploading another image.
     const save=originalAction(original);
-    const action=makeAction(original,()=>uploadFromSaveAction(context,save));
+    const browserIndex=labels.findIndex(isBrowser);
+    const open=browserIndex>=0?originalAction(arr[browserIndex]):null;
+    const action=makeAction(original,()=>uploadWithFallbacks(context,save,open));
     if (!action) { state.last='找到圖片選單，但無法安全複製保存項目';return null; }
     const result=arr.slice();result.splice(pos+1,0,action);
     state.injections++;
@@ -665,7 +779,7 @@
         h(RN.Switch,{value:!!form[name],onValueChange:x=>edit(name,x)}));
       const info = (k,v) => tx(k + '：' + String(v),{fontSize:13,color:'#b6baca',marginBottom:5});
       return h(RN.ScrollView,{style:{flex:1},contentContainerStyle:{padding:18,paddingBottom:55}},
-        tx('保存到 Card v1.5（SillyTavern 角色卡規則）',{fontSize:23,fontWeight:'bold'}),
+        tx('保存到 Card v1.6（圖片來源修正版）',{fontSize:23,fontWeight:'bold'}),
         tx('在 Discord 圖片右上角 ⋮ 選單中使用。僅在點擊按鈕時上傳。',{color:'#aeb4c8'}),
         fld('server','CardVault 網址'),fld('username','CardVault 用戶名'),fld('password','CardVault 密碼',true),
         tog('allowHttp','允許 HTTP 明文連線','你的 CardVault 目前是 HTTP；帳密可能被網路截取'),
@@ -675,6 +789,11 @@
         info('圖片檢視器 Hook',state.viewerHooks.join(', ')||'未找到'),
         info('renderMedia 鉤子',state.renderMediaHooks.join(', ')||'未找到'),
         info('renderMedia 呼叫',state.renderMediaCalls),
+        info('瀏覽器來源捕捉嘗試',state.browserAttempts),
+        info('瀏覽器來源捕捉成功',state.browserCaptures),
+        info('瀏覽器動作攔截',state.browserHookNames.join(', ')||'未執行'),
+        info('瀏覽器來源狀態',state.browserReason||'尚未測試'),
+        info('最近圖片來源',state.lastSourcePath||'尚未找到'),
         info('Discord 原生保存 Hook',nativeDownload.hook?'是':'否'),
         info('原生保存捕獲',nativeDownload.captures),
         info('目前來源類型',state.mediaType||'未知'),
@@ -687,7 +806,7 @@
         info('最近狀態',state.last),info('最近錯誤',state.error||'無'),
         h(RN.Pressable,{style:{backgroundColor:'#5865f2',borderRadius:10,padding:14,marginTop:20},onPress:()=>refresh(x=>x+1)},
           tx('更新診斷',{fontSize:16,fontWeight:'bold',textAlign:'center',marginBottom:0})),
-        tx('依照 SillyTavern PNG 角色卡格式驗證後，仍向既有 CardVault /api/cards/import 傳原始 PNG。這無法替代 Discord 圖片來源取得；原生保存兜底可能另存相冊。實機需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
+        tx('依照 SillyTavern PNG 角色卡格式驗證後，仍向既有 CardVault /api/cards/import 傳原始 PNG。圖片地址優先從選單「在瀏覽器中開啟」的動作攔截，不主動開啟瀏覽器。原生保存兜底可能另存相冊。實機仍需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
       );
     }
   };
