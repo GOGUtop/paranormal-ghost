@@ -1,0 +1,12 @@
+{
+  "name": "保存到 Card (完整功能候選版 1.0)",
+  "description": "Revenge Vendetta 導入 Discord PNG 角色卡到 CardVault；含設定、圖片選單掛接、原始 PNG 檢測與 API 上傳；手機菜單適配待驗證。",
+  "authors": [
+    {
+      "name": "CardVault integration"
+    }
+  ],
+  "main": "index.js",
+  "version": "1.0.0",
+  "hash": "e2d1af5e5722cab2e734fe8580500f644595845aac86eba707c1c2f85203b0f8"
+}
