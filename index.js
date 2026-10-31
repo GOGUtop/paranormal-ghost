@@ -5,13 +5,13 @@
   const MAX_BYTES = 30 * 1024 * 1024;
   const MAX_CONTEXT_AGE_MS = 60 * 1000;
   const state = {
-    started: false, sheetHook: false, viewerHooks: [], jsxHooks: [], jsxCalls: 0, jsxMenuMatches: 0, lazyCalls: 0, sheets: 0, menuMatches: 0,
+    viewerTrackingAt: 0, jsxSourcesSeen: 0, started: false, sheetHook: false, viewerHooks: [], jsxHooks: [], jsxCalls: 0, jsxMenuMatches: 0, lazyCalls: 0, sheets: 0, menuMatches: 0,
     renderMediaHooks: [], renderMediaCalls: 0, renderMediaURLs: 0, renderMediaAmbiguous: false, mediaType: '', sourceReason: '',
     injections: 0, clicks: 0, uploads: 0, contextUrl: '', contextAt: 0, renderMediaURL: '', viewerSources: [],
     last: '尚未啟動', error: '', lastUpload: ''
   };
   const cleanups = [];
-  const config = {server: 'http://aaa.xixisillytavern.top:8788', username: '', password: '', allowHttp: false, onlyCard: false};
+  const config = {server: 'http://aaa.xixisillytavern.top:8788', username: '', password: '', allowHttp: false, onlyCard: true};
   let busy = false;
   const text = x => String(x == null ? '' : x).slice(0, 300);
   const logger = s => { try { v.logger?.log?.('[SaveToCard] ' + text(s)); } catch (_) {} };
@@ -20,12 +20,14 @@
   for (const k of Object.keys(config)) {
     if (store && typeof store[k] === typeof config[k]) config[k] = store[k];
   }
-  // The user requested no PNG/card prerequisite. Override persisted strict filter.
-  config.onlyCard = false;
-  if (store) { try { store.onlyCard = false; } catch (_) {} }
+  // The supplied Windows CardVault importer only imports raw PNG character cards.
+  // Prior 'allow all images' setting is deliberately disabled for protocol fidelity.
+  config.onlyCard = true;
+  if (store) { try { store.onlyCard = true; } catch (_) {} }
   const saveConfig = (key, value) => {
     if (!Object.prototype.hasOwnProperty.call(config, key)) return;
     config[key] = value;
+    if (key === 'onlyCard') value = true;
     if (store) { try { store[key] = value; } catch (e) { state.error = '保存設定失敗: ' + text(e); } }
   };
   const reportError = e => { state.error = text(e && e.message ? e.message : e); logger(state.error); };
@@ -216,27 +218,109 @@
     if (state.contextUrl && Date.now() - state.contextAt < MAX_CONTEXT_AGE_MS) return state.contextUrl;
     // renderMedia belongs to the full-screen viewer. Never select one of
     // several distinct attachments (carousel/batch) by guesswork.
-    if (!state.renderMediaAmbiguous && state.renderMediaURL) return state.renderMediaURL;
+    if (!state.renderMediaAmbiguous && state.renderMediaURL && Date.now() - state.viewerTrackingAt < 90000) return state.renderMediaURL;
     return '';
   };
-  const pngHasMetadata = bytes => {
-    const sig = [137,80,78,71,13,10,26,10];
-    if (bytes.length < 8 || sig.some((n,i) => bytes[i] !== n)) throw Error('檔案不是 PNG');
-    let p = 8;
-    while (p + 12 <= bytes.length) {
-      const len = ((bytes[p]*0x1000000)+(bytes[p+1]<<16)+(bytes[p+2]<<8)+bytes[p+3]) >>> 0;
-      if (len > bytes.length - p - 12) throw Error('PNG 區塊長度異常');
-      const type = String.fromCharCode(bytes[p+4],bytes[p+5],bytes[p+6],bytes[p+7]);
-      if (type === 'tEXt' || type === 'zTXt' || type === 'iTXt') {
-        let end = p+8, max = Math.min(p+8+len,p+88);
-        while (end < max && bytes[end] !== 0) end++;
-        const keyword = String.fromCharCode(...bytes.slice(p+8,end)).toLowerCase();
-        if (keyword === 'chara' || keyword === 'ccv3') return true;
+  // SillyTavern-compatible PNG character card reader.
+  // ST primarily uses tEXt chunks containing Base64(UTF-8(JSON)); prefers
+  // ccv3 (Character Card V3) over chara (V2 / legacy V1). Never alter the PNG.
+  const readSillyTavernCard = bytes => {
+    const signature = [137,80,78,71,13,10,26,10];
+    if (bytes.length < 33 || signature.some((x,i)=>bytes[i]!==x)) throw Error('不是有效的 PNG 原圖');
+    const read32 = i => bytes[i] * 0x1000000 + bytes[i+1]*65536 + bytes[i+2]*256 + bytes[i+3];
+    const ascii = (a,b) => {
+      let s='';
+      for(let p=a;p<b;p+=8192) s+=String.fromCharCode(...bytes.subarray(p,Math.min(p+8192,b)));
+      return s;
+    };
+    const decodeUtf8 = buf => {
+      if (typeof TextDecoder === 'function') {
+        try { return new TextDecoder('utf-8',{fatal:true}).decode(buf); } catch(e) { throw Error('角色卡 JSON 不是有效 UTF-8'); }
       }
-      p += 12+len;
-      if (type === 'IEND') break;
+      // Hermes builds may not expose TextDecoder. Validate Unicode strictly.
+      let output='';
+      for(let i=0;i<buf.length;){
+        const b=buf[i++];let cp,extra,min;
+        if(b<128){cp=b;extra=0;min=0;}
+        else if(b>=194&&b<=223){cp=b&31;extra=1;min=128;}
+        else if(b>=224&&b<=239){cp=b&15;extra=2;min=2048;}
+        else if(b>=240&&b<=244){cp=b&7;extra=3;min=65536;}
+        else throw Error('角色卡 JSON UTF-8 格式錯誤');
+        for(let j=0;j<extra;j++){
+          if(i>=buf.length||buf[i]<128||buf[i]>191)throw Error('角色卡 JSON UTF-8 格式錯誤');
+          cp=(cp<<6)|(buf[i++]&63);
+        }
+        if(cp<min||cp>1114111||(cp>=55296&&cp<=57343))throw Error('角色卡 JSON UTF-8 格式錯誤');
+        if(cp<=65535)output+=String.fromCharCode(cp);
+        else {cp-=65536;output+=String.fromCharCode(55296+(cp>>10),56320+(cp&1023));}
+      }
+      return output;
+    };
+    const base64Bytes = input => {
+      const str=input.replace(/\s+/g,'');
+      if(str.length>9*1024*1024||!str||str.length%4===1||!/^[A-Za-z0-9+/]*={0,2}$/.test(str))throw Error('角色卡 Base64 格式錯誤');
+      const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      const out=new Uint8Array(Math.ceil(str.length*3/4));let at=0,bits=0,bucket=0;
+      for(let i=0;i<str.length;i++){
+        const c=str[i];if(c==='=')break;
+        const n=alphabet.indexOf(c);if(n<0)throw Error('角色卡 Base64 格式錯誤');
+        bucket=(bucket<<6)|n;bits+=6;
+        if(bits>=8){bits-=8;out[at++]=(bucket>>>bits)&255;}
+      }
+      if(at>8*1024*1024)throw Error('角色卡 JSON 過大');
+      return out.subarray(0,at);
+    };
+    const contents={ccv3:[],chara:[]};
+    let pos=8,ihdr=false,iend=false,unsupportedCompression=false;
+    for(let chunks=0;pos+12<=bytes.length&&chunks<20000;chunks++){
+      const size=read32(pos);
+      if(size>bytes.length-pos-12)throw Error('PNG 區塊長度無效，可能已損壞');
+      const typ=ascii(pos+4,pos+8), start=pos+8, stop=start+size;
+      if(typ==='IHDR')ihdr=true;
+      if(['tEXt','iTXt','zTXt'].includes(typ)&&size<=9*1024*1024){
+        let nul=start;while(nul<stop&&nul-start<=79&&bytes[nul]!==0)nul++;
+        if(nul<stop&&nul-start<=79){
+          const key=ascii(start,nul);
+          if(key==='ccv3'||key==='chara'){
+            if(typ==='tEXt')contents[key].push(ascii(nul+1,stop));
+            else if(typ==='zTXt')unsupportedCompression=true;
+            else if(nul+2<stop){
+              const compressed=bytes[nul+1];
+              let p=nul+3; // compression flag, compression method
+              for(let field=0;field<2&&p<stop;field++){
+                while(p<stop&&bytes[p]!==0)p++;
+                p++; // language tag and translated keyword
+              }
+              if(compressed===0&&p<=stop)contents[key].push(ascii(p,stop));
+              else unsupportedCompression=true;
+            }
+          }
+        }
+      }
+      pos=stop+4; // skip CRC without changing a single byte
+      if(typ==='IEND'){iend=true;break;}
     }
-    return false;
+    if(!ihdr||!iend)throw Error('PNG 區塊結構不完整');
+    let invalid='';
+    for(const key of ['ccv3','chara']){
+      for(const payload of contents[key]){
+        try {
+          const decoded=decodeUtf8(base64Bytes(payload));
+          const card=JSON.parse(decoded);
+          if(!card||typeof card!=='object'||Array.isArray(card))throw Error('角色卡 JSON 不是物件');
+          const wrapped=card.data&&typeof card.data==='object'&&!Array.isArray(card.data);
+          const data=wrapped?card.data:card;
+          if(typeof data.name!=='string'||!data.name.trim())throw Error('角色卡缺少角色名稱');
+          const spec=typeof card.spec==='string'?card.spec:'';
+          if(wrapped && spec && !/^chara_card_v[23]$/.test(spec))throw Error('角色卡 spec 不支援');
+          if(!wrapped&&!['description','personality','scenario','first_mes','mes_example'].some(k=>Object.prototype.hasOwnProperty.call(data,k)))throw Error('缺少角色卡內容欄位');
+          return {kind:key,version:key==='ccv3'?'V3':(spec==='chara_card_v2'?'V2':'V1/V2'),name:data.name.trim().slice(0,80)};
+        } catch(e) { invalid=String(e&&e.message||e); }
+      }
+    }
+    if(invalid)throw Error('包含角色卡欄位，但解析失敗：'+invalid.slice(0,110));
+    if(unsupportedCompression)throw Error('角色卡使用壓縮文字區塊，當前解析器暫不支援');
+    throw Error('未找到 SillyTavern 角色卡資料（ccv3/chara）；請使用未經轉碼的原始 PNG');
   };
   const serverBase = () => {
     let u;
@@ -264,20 +348,30 @@
       if (raw.byteLength > MAX_BYTES) throw Error('圖片超過 30 MB');
       const bytes = new Uint8Array(raw);
       const mime = mimeOf(bytes);
-      if (config.onlyCard && (mime !== 'image/png' || !pngHasMetadata(bytes))) throw Error('開啟了只導入角色卡，但此圖片不是含 chara/ccv3 的 PNG');
-      toast('登入 CardVault…');
+      if (mime !== 'image/png') throw Error('依照 SillyTavern 規則：角色卡需要原始 PNG；本張圖片為 '+mime+'，已停止');
+      const cardInfo = readSillyTavernCard(bytes);
+      state.last = '已解析 SillyTavern ' + cardInfo.version + ' 角色卡：' + cardInfo.name;
+      toast('已找到 ' + cardInfo.version + ' 角色卡，正在登入 CardVault…');
       const login = await fetch(base + '/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:config.username,password:config.password})});
       if (!login.ok) throw Error('登入失敗 HTTP ' + login.status);
       const json = await login.json();
       const token = json?.token || json?.data?.token;
       if (typeof token !== 'string' || !token) throw Error('登入結果未提供 token');
-      const filename = (decodeURIComponent(new URL(src).pathname.split('/').pop() || 'discord-image')).replace(/[\r\n\\]/g,'_').slice(0,180);
+      const filename = (decodeURIComponent(new URL(src).pathname.split('/').pop() || 'discord-card.png')).replace(/[\r\n\\]/g,'_').slice(0,180);
       toast('上傳到 CardVault…');
-      const response = await fetch(base + '/api/cards/import', { method:'POST',headers:{'Content-Type':mime,'Authorization':'Bearer '+token,'X-File-Name':filename},body:raw });
-      if (!response.ok) throw Error('CardVault 拒絕這張圖片 HTTP '+response.status+'（網站可能只接受角色卡 PNG）：'+(await response.text()).slice(0,100));
+      const response = await fetch(base + '/api/cards/import', { method:'POST',headers:{'Content-Type':'image/png','Authorization':'Bearer '+token,'X-File-Name':filename},body:raw });
+      if (!response.ok) throw Error('CardVault 上傳失敗 HTTP '+response.status+'：'+(await response.text()).slice(0,160));
+      // A HTTP 200 response may still report an application-level failure.
+      // Do not claim success when the backend explicitly rejects an import.
+      const serverAnswer = await response.text();
+      let parsed = null;
+      try { parsed = JSON.parse(serverAnswer); } catch (_) {}
+      if (parsed && typeof parsed==='object' && (parsed.success === false || parsed.ok === false)) {
+        throw Error('CardVault 回報失敗：'+text(parsed.message||parsed.error||serverAnswer));
+      }
       state.uploads++;
       state.lastUpload = filename;
-      toast('已保存到 Card：' + filename);
+      toast('已保存到 Card：' + cardInfo.name);
     } catch (e) { reportError(e); toast('保存到 Card 失敗：' + state.error); }
     finally { busy = false; }
   };
@@ -452,6 +546,20 @@
   const inspectElement = element => {
     state.jsxCalls++;
     if(!element || typeof element!=='object' || !element.props)return element;
+    // Source capture from freshly created image elements in the *open* media
+    // viewer. Only inspect direct image source props (never message text).
+    // Multiple distinct CDN attachments are treated as ambiguous, not guessed.
+    if (state.viewerTrackingAt && Date.now() - state.viewerTrackingAt < 90000) {
+      const props=element.props;
+      const sources = [props.source,props.src,props.imageSource,props.mediaSource,props.imageURI,props.imageUrl];
+      for (const candidate of sources) {
+        const urls = mediaRecords(candidate,3);
+        if (urls.length) {
+          state.jsxSourcesSeen += urls.length;
+          updateViewerSource(candidate,'React/JSX 圖片來源');
+        }
+      }
+    }
     const changed=transformMenu(element.props);
     if(!changed)return element;
     const React=v.metro?.common?.React;
@@ -511,6 +619,7 @@
     } catch(e) { reportError(e); return false; }
   };
   const rememberViewerContext = args => {
+    state.viewerTrackingAt=Date.now();
     state.viewerSources = [];state.renderMediaURL='';state.renderMediaAmbiguous=false;
     state.mediaType='';state.sourceReason='查看器已開啟，等待媒體來源';
     if (!args || !Array.isArray(args)) return;
@@ -538,7 +647,7 @@
     onUnload() {
       while (cleanups.length) { try { cleanups.pop()(); } catch (e) { logger(e); } }
       state.started = false;
-      state.contextUrl = '';state.renderMediaURL='';state.viewerSources=[];waitingSave=null;
+      state.contextUrl = '';state.renderMediaURL='';state.viewerSources=[];state.viewerTrackingAt=0;waitingSave=null;
     },
     settings: function SaveToCardSettings() {
       const React = v.metro?.common?.React, RN = v.metro?.common?.ReactNative;
@@ -556,11 +665,11 @@
         h(RN.Switch,{value:!!form[name],onValueChange:x=>edit(name,x)}));
       const info = (k,v) => tx(k + '：' + String(v),{fontSize:13,color:'#b6baca',marginBottom:5});
       return h(RN.ScrollView,{style:{flex:1},contentContainerStyle:{padding:18,paddingBottom:55}},
-        tx('保存到 Card v1.3',{fontSize:23,fontWeight:'bold'}),
+        tx('保存到 Card v1.5（SillyTavern 角色卡規則）',{fontSize:23,fontWeight:'bold'}),
         tx('在 Discord 圖片右上角 ⋮ 選單中使用。僅在點擊按鈕時上傳。',{color:'#aeb4c8'}),
         fld('server','CardVault 網址'),fld('username','CardVault 用戶名'),fld('password','CardVault 密碼',true),
         tog('allowHttp','允許 HTTP 明文連線','你的 CardVault 目前是 HTTP；帳密可能被網路截取'),
-        tx('圖片會直接傳到 CardVault；不檢查 PNG 或角色卡。網站可能拒絕非角色卡圖片。',{fontSize:12,color:'#b6baca'}),
+        tx('遵循 SillyTavern：優先 ccv3，回退 chara，解碼 Base64/UTF-8/JSON 驗證；只上傳原始 PNG，不轉碼。',{fontSize:12,color:'#b6baca'}),
         tx('執行狀態',{fontSize:18,fontWeight:'bold',marginTop:14}),
         info('已啟動',state.started?'是':'否'),info('圖片選單 Hook',state.sheetHook?'是':'否'),
         info('圖片檢視器 Hook',state.viewerHooks.join(', ')||'未找到'),
@@ -570,7 +679,7 @@
         info('原生保存捕獲',nativeDownload.captures),
         info('目前來源類型',state.mediaType||'未知'),
         info('來源辨識',state.sourceReason||'尚未檢查'),
-        info('React/JSX 鉤子',state.jsxHooks.join(', ')||'未找到'),info('JSX 執行次數',state.jsxCalls),
+        info('React/JSX 鉤子',state.jsxHooks.join(', ')||'未找到'),info('JSX 執行次數',state.jsxCalls),info('查看器圖片來源探測',state.jsxSourcesSeen),
         info('JSX 圖片選單命中',state.jsxMenuMatches),info('openLazy 呼叫',state.lazyCalls),
         info('ActionSheet 呼叫',state.sheets),info('圖片選單命中',state.menuMatches),
         info('插入次數',state.injections),info('按鈕點擊',state.clicks),info('成功上傳',state.uploads),
@@ -578,7 +687,7 @@
         info('最近狀態',state.last),info('最近錯誤',state.error||'無'),
         h(RN.Pressable,{style:{backgroundColor:'#5865f2',borderRadius:10,padding:14,marginTop:20},onPress:()=>refresh(x=>x+1)},
           tx('更新診斷',{fontSize:16,fontWeight:'bold',textAlign:'center',marginBottom:0})),
-        tx('本版不要求 PNG 後綴；若無來源，嘗試調用 Discord 原生保存，可能同時保存到相冊。CardVault 是否接受普通 JPG 由網站決定。實機需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
+        tx('依照 SillyTavern PNG 角色卡格式驗證後，仍向既有 CardVault /api/cards/import 傳原始 PNG。這無法替代 Discord 圖片來源取得；原生保存兜底可能另存相冊。實機需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
       );
     }
   };

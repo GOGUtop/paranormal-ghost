@@ -1,12 +1,12 @@
 {
-  "name": "保存到 Card（直接保存圖片 v1.3）",
-  "description": "移除 PNG 前置限制；使用目前圖片，缺少地址時可嘗試借用 Discord 原生保存動作；CardVault 導入能力仍由網站決定。",
+  "name": "保存到 Card（SillyTavern 角色卡 v1.5）",
+  "description": "按 SillyTavern V1/V2/V3 讀取 ccv3/chara Base64 JSON，保留原始 PNG，再透過既有 CardVault API 上傳；Discord 圖片來源尚需實機確認。",
   "authors": [
     {
       "name": "CardVault integration"
     }
   ],
   "main": "index.js",
-  "version": "1.3.0",
-  "hash": "63782769bc0b396f45ec5b2e956a6ad9facaa07bf15253f30a56d8b1fecc7cb4"
+  "version": "1.5.0",
+  "hash": "51ba78c73873b6b9fbcaa89c776cd222bc23854b"
 }
