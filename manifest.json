@@ -1,12 +1,12 @@
 {
-  "name": "保存到 Card（完整候選版 1.1）",
-  "description": "Revenge Vendetta：新增 React/JSX 圖片菜單攔截、PNG 角色卡識別及 CardVault 上傳；Discord 351.11 實機待驗證。",
+  "name": "保存到 Card（原始 PNG 辨識 v1.2）",
+  "description": "修復圖片選單點擊後缺少原始 PNG 地址：增加全屏查看器 renderMedia 來源檢測，保留角色卡檢測與 CardVault 上傳。",
   "authors": [
     {
       "name": "CardVault integration"
     }
   ],
   "main": "index.js",
-  "version": "1.1.0",
-  "hash": "64e417db2ad2e117a54deb238a7f55ab1477a83be31d82ab6f6e06b7cb8310f3"
+  "version": "1.2.0",
+  "hash": "bcbebdd3df3660f11eca52f468039a09f98e77ea55b9b65c5944a0268a99c194"
 }

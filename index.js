@@ -6,7 +6,8 @@
   const MAX_CONTEXT_AGE_MS = 20 * 1000;
   const state = {
     started: false, sheetHook: false, viewerHooks: [], jsxHooks: [], jsxCalls: 0, jsxMenuMatches: 0, lazyCalls: 0, sheets: 0, menuMatches: 0,
-    injections: 0, clicks: 0, uploads: 0, contextUrl: '', contextAt: 0,
+    renderMediaHooks: [], renderMediaCalls: 0, renderMediaURLs: 0, renderMediaAmbiguous: false, mediaType: '', sourceReason: '',
+    injections: 0, clicks: 0, uploads: 0, contextUrl: '', contextAt: 0, renderMediaURL: '', viewerSources: [],
     last: '尚未啟動', error: '', lastUpload: ''
   };
   const cleanups = [];
@@ -41,6 +42,96 @@
     }
     return u.href;
   };
+  // Inspect the *current full-screen viewer* instead of assuming that a popup
+  // contains attachment metadata. A renderer may receive a proxy image URI in
+  // source.uri or an attachment.url in its media props.
+  const mediaRecord = candidate => {
+    if (typeof candidate !== 'string' || candidate.length > 3000) return null;
+    let u; try { u = new URL(candidate); } catch (_) { return null; }
+    if (u.protocol !== 'https:' || !['cdn.discordapp.com','media.discordapp.net'].includes(u.hostname)) return null;
+    if (!/^\/(?:attachments|ephemeral-attachments)\/[^?#]+\.(png|jpe?g|webp|gif|avif)$/i.test(u.pathname)) return null;
+    const extension = u.pathname.split('.').pop().toLowerCase();
+    const png = extension === 'png';
+    if (u.hostname === 'media.discordapp.net') {
+      u.hostname = 'cdn.discordapp.com';
+      for (const k of Array.from(u.searchParams.keys())) {
+        if (!['ex','is','hm'].includes(k)) u.searchParams.delete(k);
+      }
+    }
+    return {url:u.href, extension, png};
+  };
+  // Bounded inspection of renderMedia() arguments/results. Only attachment
+  // sources are considered; no message text or authentication data is saved.
+  const mediaRecords = (root, maxDepth = 8) => {
+    const records = new Map(), seen = new Set(); let count = 0;
+    const allowed = /^(props|children|url|uri|src|source|sourceUri|sourceURL|mediaSource|imageSource|imageURI|mediaURI|contentUri|originalUrl|originalURL|originalUri|originalSource|original|asset|attachment|attachments|image|images|media|mediaItem|mediaData|items|item|data|message|selected|current|selectedItem|currentItem|selectedMedia|preview|file|fileURL|fileUrl|cdnUrl|proxy_url|proxyURL|proxyUrl|mediaUrl|mediaURL|fullUrl|fullURL|renderData|renderItem|content|imageUrl|imageURL|sourceUrl)$/i;
+    const visit = (value, depth) => {
+      if (count++ > 320 || depth > maxDepth || !value) return;
+      if (typeof value === 'string') {
+        const rec = mediaRecord(value); if (rec) records.set(rec.url,rec);
+        return;
+      }
+      if (typeof value !== 'object' || seen.has(value)) return;
+      seen.add(value);
+      if (Array.isArray(value)) {
+        value.slice(0,15).forEach(v=>visit(v,depth+1));
+        return;
+      }
+      let index = 0;
+      for (const [key,val] of Object.entries(value)) {
+        if (++index > 65) break;
+        if (allowed.test(key)) visit(val,depth+1);
+      }
+    };
+    visit(root,0);
+    return [...records.values()];
+  };
+  const updateViewerSource = (args, from) => {
+    const found = mediaRecords(args);
+    if (!found.length) return;
+    state.renderMediaURLs += found.length;
+    const urls = new Set(state.viewerSources);
+    found.forEach(x=>urls.add(x.url));
+    state.viewerSources = [...urls].slice(0,12);
+    state.renderMediaAmbiguous = state.viewerSources.length > 1;
+    const single = state.viewerSources.length === 1 ? mediaRecord(state.viewerSources[0]) : null;
+    state.renderMediaURL = single && single.png ? single.url : '';
+    state.mediaType = single ? single.extension.toUpperCase() : (state.renderMediaAmbiguous ? '多張圖片，來源不唯一' : '');
+    state.sourceReason = from + '：' + (state.renderMediaAmbiguous ? '多張來源' : (single ? single.extension : '找不到來源'));
+  };
+  const installRenderMediaHooks = () => {
+    const candidates = [];
+    const add = (obj,desc) => {
+      if (!obj || typeof obj.renderMedia !== 'function' || candidates.some(x=>x.obj===obj)) return;
+      candidates.push({obj,desc});
+    };
+    try {add(v.metro?.findByProps?.('renderMedia'),'renderMedia export');}catch(_){}
+    try {
+      const named = v.metro?.findByProps?.('MediaViewerItemPresenter');
+      const presenter = named?.MediaViewerItemPresenter;
+      add(presenter?.prototype,'MediaViewerItemPresenter.prototype');
+      add(presenter,'MediaViewerItemPresenter');
+    }catch(_){}
+    try {
+      const named = v.metro?.findByName?.('MediaViewerItemPresenter');
+      add(named?.prototype,'named presenter prototype');
+    }catch(_){}
+    for (const {obj,desc} of candidates) {
+      const off = v.patcher?.before?.('renderMedia',obj,args=>{
+        state.renderMediaCalls++;
+        updateViewerSource(args,'renderMedia 參數');
+      });
+      if (typeof off === 'function') {cleanups.push(off);state.renderMediaHooks.push(desc);}
+      // In some builds the resolved source appears only in the returned
+      // React element, not in the render callback arguments.
+      try {
+        const after=v.patcher?.after?.('renderMedia',obj,(args,result)=>{
+          updateViewerSource(result,'renderMedia 渲染結果');
+        });
+        if (typeof after==='function') {cleanups.push(after);state.renderMediaHooks.push(desc+' output');}
+      }catch(e){reportError(e);}
+    }
+  };
   const allCandidateURLs = (root, limitDepth = 5) => {
     const found = new Set(), seen = new Set();
     const visit = (obj, depth) => {
@@ -57,11 +148,20 @@
     return [...found];
   };
   const currentURL = sheet => {
-    const direct = allCandidateURLs(sheet);
-    if (direct.length === 1) return direct[0];
-    // Never use a previous image if the sheet points at a different or ambiguous attachment.
-    if (direct.length > 1) return '';
+    // Prefer the individual menu's attached original URL when available.
+    const explicit = mediaRecords(sheet,6);
+    if (explicit.length > 1) {state.sourceReason='選單包含多個附件';return '';}
+    if (explicit.length === 1) {
+      state.mediaType=explicit[0].extension.toUpperCase();
+      state.sourceReason='選單附件';
+      return explicit[0].png ? explicit[0].url : '';
+    }
+    // openMediaModal often has only navigation flags; its payload, when
+    // available, is more specific than a broad message-attachment scan.
     if (state.contextUrl && Date.now() - state.contextAt < MAX_CONTEXT_AGE_MS) return state.contextUrl;
+    // renderMedia belongs to the full-screen viewer. Never select one of
+    // several distinct attachments (carousel/batch) by guesswork.
+    if (!state.renderMediaAmbiguous && state.renderMediaURL) return state.renderMediaURL;
     return '';
   };
   const pngHasMetadata = bytes => {
@@ -95,7 +195,7 @@
     state.clicks++;
     busy = true;
     try {
-      if (!url) throw Error('未找到當前圖片的原始 PNG 地址，已取消上傳');
+      if (!url) throw Error(state.renderMediaAmbiguous ? '查看器有多個來源，無法確定目前圖片，已取消上傳' : (state.mediaType && state.mediaType !== 'PNG' ? ('當前附件格式是 '+state.mediaType+'，不是原始 PNG 角色卡，已取消上傳') : '尚未取得當前圖片的原始 PNG 地址，已取消上傳'));
       const src = fileURL(url);
       if (!src) throw Error('目前只能上傳 Discord CDN 的原始 PNG 附件');
       if (!config.username || !config.password) throw Error('請先在插件設定中輸入 CardVault 帳號密碼');
@@ -354,11 +454,14 @@
     } catch(e) { reportError(e); return false; }
   };
   const rememberViewerContext = args => {
-    // Only opportunistically capture a unique *original PNG attachment* from viewer args.
+    state.viewerSources = [];state.renderMediaURL='';state.renderMediaAmbiguous=false;
+    state.mediaType='';state.sourceReason='查看器已開啟，等待媒體來源';
     if (!args || !Array.isArray(args)) return;
-    const urls = allCandidateURLs(args, 6);
-    if (urls.length === 1) { state.contextUrl = urls[0]; state.contextAt = Date.now(); }
-    else { state.contextUrl = ''; state.contextAt = 0; }
+    const records = mediaRecords(args,8);
+    state.contextUrl = records.length===1 && records[0].png ? records[0].url : '';
+    state.contextAt = state.contextUrl ? Date.now() : 0;
+    if (records.length===1) {state.mediaType=records[0].extension.toUpperCase();state.sourceReason='openMediaModal 參數';}
+    else if (records.length>1) {state.sourceReason='openMediaModal 多張候選附件';}
   };
   const plugin = {
     onLoad() {
@@ -367,6 +470,7 @@
       state.last = '插件已啟動';
       state.sheetHook = patchMethod('showSimpleActionSheet', null, inspectSheet);
       installJSXHooks();
+      installRenderMediaHooks();
       const mediaMethodNames = ['openMediaModal', 'openMediaViewer', 'openImageViewer', 'openMediaCarousel', 'openImageModal'];
       for (const method of mediaMethodNames) {
         if (patchMethod(method, null, rememberViewerContext)) state.viewerHooks.push(method);
@@ -376,7 +480,7 @@
     onUnload() {
       while (cleanups.length) { try { cleanups.pop()(); } catch (e) { logger(e); } }
       state.started = false;
-      state.contextUrl = '';
+      state.contextUrl = '';state.renderMediaURL='';state.viewerSources=[];
     },
     settings: function SaveToCardSettings() {
       const React = v.metro?.common?.React, RN = v.metro?.common?.ReactNative;
@@ -394,7 +498,7 @@
         h(RN.Switch,{value:!!form[name],onValueChange:x=>edit(name,x)}));
       const info = (k,v) => tx(k + '：' + String(v),{fontSize:13,color:'#b6baca',marginBottom:5});
       return h(RN.ScrollView,{style:{flex:1},contentContainerStyle:{padding:18,paddingBottom:55}},
-        tx('保存到 Card',{fontSize:23,fontWeight:'bold'}),
+        tx('保存到 Card v1.2',{fontSize:23,fontWeight:'bold'}),
         tx('在 Discord 圖片右上角 ⋮ 選單中使用。僅在點擊按鈕時上傳。',{color:'#aeb4c8'}),
         fld('server','CardVault 網址'),fld('username','CardVault 用戶名'),fld('password','CardVault 密碼',true),
         tog('onlyCard','只導入角色卡','檢查 PNG chara / ccv3 中繼資料'),
@@ -402,15 +506,19 @@
         tx('執行狀態',{fontSize:18,fontWeight:'bold',marginTop:14}),
         info('已啟動',state.started?'是':'否'),info('圖片選單 Hook',state.sheetHook?'是':'否'),
         info('圖片檢視器 Hook',state.viewerHooks.join(', ')||'未找到'),
+        info('renderMedia 鉤子',state.renderMediaHooks.join(', ')||'未找到'),
+        info('renderMedia 呼叫',state.renderMediaCalls),
+        info('目前來源類型',state.mediaType||'未知'),
+        info('來源辨識',state.sourceReason||'尚未檢查'),
         info('React/JSX 鉤子',state.jsxHooks.join(', ')||'未找到'),info('JSX 執行次數',state.jsxCalls),
         info('JSX 圖片選單命中',state.jsxMenuMatches),info('openLazy 呼叫',state.lazyCalls),
         info('ActionSheet 呼叫',state.sheets),info('圖片選單命中',state.menuMatches),
         info('插入次數',state.injections),info('按鈕點擊',state.clicks),info('成功上傳',state.uploads),
-        info('目前圖片 PNG URL',state.contextUrl?'已捕獲':'尚未捕獲'),
+        info('目前圖片 PNG URL',(state.contextUrl||state.renderMediaURL)?'已捕獲':'尚未捕獲'),
         info('最近狀態',state.last),info('最近錯誤',state.error||'無'),
         h(RN.Pressable,{style:{backgroundColor:'#5865f2',borderRadius:10,padding:14,marginTop:20},onPress:()=>refresh(x=>x+1)},
           tx('更新診斷',{fontSize:16,fontWeight:'bold',textAlign:'center',marginBottom:0})),
-        tx('注意：圖片選單新增 React/JSX 攔截，實機菜單位置仍需驗證；若網址不可得，點擊不會上傳。',{fontSize:12,color:'#b6baca',marginTop:18})
+        tx('注意：新增加 renderMedia 來源辨識。遇到多張圖片或非 PNG 附件會拒絕上傳；實機需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
       );
     }
   };
