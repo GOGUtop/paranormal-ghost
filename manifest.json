@@ -1,12 +1,12 @@
 {
-  "name": "保存到 Card（圖片來源修正版 v1.6）",
-  "description": "圖片選單新增「在瀏覽器中開啟」連結攔截來源路徑；取得原始 PNG 後依 SillyTavern ccv3/chara 規則驗證並上傳 CardVault。需真機驗證。",
+  "name": "保存到 Card（一鍵保存 v1.7）",
+  "description": "一鍵操作：點擊後顯示正在保存，內部完成 Discord 原始 PNG 取得、SillyTavern 卡檢查及 CardVault 上傳，成功後顯示已保存到 Card。失敗不冒充成功。",
   "authors": [
     {
       "name": "CardVault integration"
     }
   ],
   "main": "index.js",
-  "version": "1.6.0",
-  "hash": "a5dfe3b3b5e40cbf1438d25f3ccc5bf951ad1414"
+  "version": "1.7.0",
+  "hash": "ad4394fc5871a93fe1fccfab66b0260048d37693"
 }

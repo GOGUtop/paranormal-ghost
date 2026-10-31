@@ -174,40 +174,37 @@
       timer=setTimeout(()=>finish('',unknown||'瀏覽器動作沒有提供 Discord 附件網址'),2200);
     });
   };
-  const uploadWithFallbacks = async (context, nativeSave, nativeBrowser) => {
-    // A URL from this exact popup is unambiguous. Cached viewer URLs may
-    // survive scrolling to another image, so prefer the browser menu action
-    // over cached media-viewer state when the popup lacks its own attachment.
-    const exact=mediaRecords(context,5);
-    if(exact.length===1){state.lastSourcePath='目前圖片選單';return downloadAndUpload(exact[0].url);}
-    if(exact.length>1){state.sourceReason='選單包含多個媒體來源，禁止猜測';return downloadAndUpload('');}
-    toast('正在從圖片選單取得目前附件來源…');
-    const fromBrowser=await captureFromBrowserAction(nativeBrowser);
-    if(fromBrowser)return downloadAndUpload(fromBrowser);
-    const direct=currentURL(context);
-    if(direct){state.lastSourcePath='圖片檢視器快取';return downloadAndUpload(direct);}
-    // Existing download capture remains a last resort. Calling Discord Save
-    // can also save the picture to the gallery; this is disclosed in settings.
-    return uploadFromSaveAction(context,nativeSave);
+  // A single tap is the only user operation. We never invoke Discord's native
+  // Save action: it may write to the gallery or show additional UI.
+  // Only read the current viewer URL or silently intercept the existing browser
+  // action when an opener can be patched. If no safe source is available, fail.
+  const resolveCurrentImage = async (context, nativeBrowser) => {
+    const exact = mediaRecords(context,5);
+    if (exact.length > 1) throw Error('無法確定目前圖片（找到多個來源）');
+    if (exact.length === 1) { state.lastSourcePath='目前圖片選單';return exact[0].url; }
+    const direct = currentURL(context);
+    if (direct) { state.lastSourcePath='圖片檢視器';return direct; }
+    const fromBrowser = await captureFromBrowserAction(nativeBrowser);
+    if (fromBrowser) return fromBrowser;
+    throw Error('無法取得目前圖片的原始檔案');
   };
-  const uploadFromSaveAction = async (context, nativeSave) => {
-    const direct=currentURL(context);
-    if(direct) return downloadAndUpload(direct);
-    if(!nativeSave || typeof nativeSave.fn!=='function') return downloadAndUpload('');
-    if(waitingSave) return toast('另一張圖片正在等待來源，請稍後');
-    toast('正在使用 Discord 原生保存取得圖片來源…');
-    const url=await new Promise(resolve=>{
-      const pending={resolve};waitingSave=pending;
-      const finish=()=>{if(waitingSave===pending){waitingSave=null;resolve('');}};
-      try {
-        const result=nativeSave.fn.call(nativeSave.receiver);
-        if(result && typeof result.catch==='function') result.catch(reportError);
-      }catch(e){reportError(e);finish();return;}
-      setTimeout(finish,1800);
-    });
-    if(!url){state.sourceReason='原生保存沒有提供可讀取的媒體地址；'+(state.browserReason||'');return downloadAndUpload('');}
-    state.sourceReason='Discord 原生保存攔截';
-    return downloadAndUpload(url);
+  // Exactly one progress toast and one result toast per tap. The pipeline is
+  // internal: resolve -> download -> validate -> login -> upload -> confirm.
+  const oneTapSave = async (context, nativeBrowser) => {
+    if (busy) return; // no duplicate request or extra popup
+    busy = true;
+    state.clicks++;
+    state.error='';
+    toast('正在保存…');
+    try {
+      const url = await resolveCurrentImage(context,nativeBrowser);
+      await downloadAndUpload(url);
+      state.uploads++;
+      toast('已保存到 Card');
+    } catch (e) {
+      reportError(e);
+      toast('保存失敗：' + state.error);
+    } finally { busy=false; }
   };
   // Inspect the *current full-screen viewer* instead of assuming that a popup
   // contains attachment metadata. A renderer may receive a proxy image URI in
@@ -440,50 +437,38 @@
     return u.origin;
   };
   const downloadAndUpload = async url => {
-    if (busy) return toast('另一張圖片正在處理');
-    state.clicks++;
-    busy = true;
-    try {
-      if (!url) throw Error(state.renderMediaAmbiguous ? '查看器有多個來源，無法確定目前圖片，已取消上傳' : '尚未取得目前圖片的來源，也未能從 Discord 原生保存取得地址');
-      const src = fileURL(url);
-      if (!src) throw Error('無法取得 Discord 圖片來源（可能是嵌入圖片或外部地址）');
-      if (!config.username || !config.password) throw Error('請先在插件設定中輸入 CardVault 帳號密碼');
-      const base = serverBase();
-      toast('正在取得目前圖片…');
-      const download = await fetch(src);
-      if (!download.ok) throw Error('下載失敗 HTTP ' + download.status);
-      const declared = Number(download.headers?.get?.('content-length') || 0);
-      if (declared > MAX_BYTES) throw Error('圖片超過 30 MB');
-      const raw = await download.arrayBuffer();
-      if (raw.byteLength > MAX_BYTES) throw Error('圖片超過 30 MB');
-      const bytes = new Uint8Array(raw);
-      const mime = mimeOf(bytes);
-      if (mime !== 'image/png') throw Error('依照 SillyTavern 規則：角色卡需要原始 PNG；本張圖片為 '+mime+'，已停止');
-      const cardInfo = readSillyTavernCard(bytes);
-      state.last = '已解析 SillyTavern ' + cardInfo.version + ' 角色卡：' + cardInfo.name;
-      toast('已找到 ' + cardInfo.version + ' 角色卡，正在登入 CardVault…');
-      const login = await fetch(base + '/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:config.username,password:config.password})});
-      if (!login.ok) throw Error('登入失敗 HTTP ' + login.status);
-      const json = await login.json();
-      const token = json?.token || json?.data?.token;
-      if (typeof token !== 'string' || !token) throw Error('登入結果未提供 token');
-      const filename = (decodeURIComponent(new URL(src).pathname.split('/').pop() || 'discord-card.png')).replace(/[\r\n\\]/g,'_').slice(0,180);
-      toast('上傳到 CardVault…');
-      const response = await fetch(base + '/api/cards/import', { method:'POST',headers:{'Content-Type':'image/png','Authorization':'Bearer '+token,'X-File-Name':filename},body:raw });
-      if (!response.ok) throw Error('CardVault 上傳失敗 HTTP '+response.status+'：'+(await response.text()).slice(0,160));
-      // A HTTP 200 response may still report an application-level failure.
-      // Do not claim success when the backend explicitly rejects an import.
-      const serverAnswer = await response.text();
-      let parsed = null;
-      try { parsed = JSON.parse(serverAnswer); } catch (_) {}
-      if (parsed && typeof parsed==='object' && (parsed.success === false || parsed.ok === false)) {
-        throw Error('CardVault 回報失敗：'+text(parsed.message||parsed.error||serverAnswer));
-      }
-      state.uploads++;
-      state.lastUpload = filename;
-      toast('已保存到 Card：' + cardInfo.name);
-    } catch (e) { reportError(e); toast('保存到 Card 失敗：' + state.error); }
-    finally { busy = false; }
+    if (!url) throw Error('無法取得目前圖片的原始檔案');
+    const src = fileURL(url);
+    if (!src) throw Error('無法取得 Discord 原始附件');
+    if (!config.username || !config.password) throw Error('CardVault 帳號尚未設定');
+    const base = serverBase();
+    const download = await fetch(src);
+    if (!download.ok) throw Error('下載圖片失敗（HTTP '+download.status+'）');
+    const declared = Number(download.headers?.get?.('content-length') || 0);
+    if (declared > MAX_BYTES) throw Error('圖片超過 30 MB');
+    const raw = await download.arrayBuffer();
+    if (raw.byteLength > MAX_BYTES) throw Error('圖片超過 30 MB');
+    const bytes = new Uint8Array(raw);
+    const mime = mimeOf(bytes);
+    if (mime !== 'image/png') throw Error('這張圖片不是 PNG 角色卡');
+    const cardInfo = readSillyTavernCard(bytes);
+    state.last = '已解析 '+cardInfo.version+' 角色卡：'+cardInfo.name;
+    const login = await fetch(base + '/api/login', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:config.username,password:config.password})});
+    if (!login.ok) throw Error('登入失敗（HTTP '+login.status+'）');
+    const json = await login.json();
+    const token = json?.token || json?.data?.token;
+    if (typeof token !== 'string' || !token) throw Error('登入沒有取得憑證');
+    let filename = 'discord-card.png';
+    try {filename = (decodeURIComponent(new URL(src).pathname.split('/').pop()||filename)).replace(/[\r\n\\]/g,'_').slice(0,180);}catch(_){}
+    const response = await fetch(base+'/api/cards/import',{method:'POST',headers:{'Content-Type':'image/png','Authorization':'Bearer '+token,'X-File-Name':filename},body:raw});
+    if (!response.ok) throw Error('CardVault 拒絕上傳（HTTP '+response.status+'）：'+(await response.text()).slice(0,100));
+    const reply = await response.text();
+    let parsed=null;
+    try {parsed=JSON.parse(reply);}catch(_){}
+    if(parsed && typeof parsed==='object' && (parsed.success===false || parsed.ok===false || parsed.error)){
+      throw Error('CardVault 回報失敗：'+text(parsed.message||parsed.error||reply));
+    }
+    state.lastUpload=filename;
   };
   const labelsOf = option => typeof option?.label === 'string' ? option.label : (typeof option?.text === 'string' ? option.text : '');
   const isSave = label => /^(保存|Save|Save Image|Save Media|Download|儲存|储存)$/i.test(label);
@@ -508,7 +493,7 @@
     const save = originalAction(original);
     const browserIndex=sheet.options.findIndex(o=>isBrowser(labelsOf(o)));
     const open=browserIndex>=0?originalAction(sheet.options[browserIndex]):null;
-    const item = { label:'保存到 Card', onPress: () => uploadWithFallbacks(sheet,save,open) };
+    const item = { label:'保存到 Card', onPress: () => oneTapSave(sheet,open) };
     if (original && original.icon != null) item.icon = original.icon;
     const options = sheet.options.slice();
     options.splice(pos + 1, 0, item);
@@ -633,7 +618,7 @@
     const save=originalAction(original);
     const browserIndex=labels.findIndex(isBrowser);
     const open=browserIndex>=0?originalAction(arr[browserIndex]):null;
-    const action=makeAction(original,()=>uploadWithFallbacks(context,save,open));
+    const action=makeAction(original,()=>oneTapSave(context,open));
     if (!action) { state.last='找到圖片選單，但無法安全複製保存項目';return null; }
     const result=arr.slice();result.splice(pos+1,0,action);
     state.injections++;
@@ -751,12 +736,12 @@
       state.sheetHook = patchMethod('showSimpleActionSheet', null, inspectSheet);
       installJSXHooks();
       installRenderMediaHooks();
-      installSaveCapture();
+      // Do not install native Save capture: a one-tap Card import must not save to gallery.
       const mediaMethodNames = ['openMediaModal', 'openMediaViewer', 'openImageViewer', 'openMediaCarousel', 'openImageModal'];
       for (const method of mediaMethodNames) {
         if (patchMethod(method, null, rememberViewerContext)) state.viewerHooks.push(method);
       }
-      toast('保存到 Card 已啟動，JSX Hooks: ' + state.jsxHooks.length);
+      state.last='插件就緒，等待點擊保存到 Card';
     },
     onUnload() {
       while (cleanups.length) { try { cleanups.pop()(); } catch (e) { logger(e); } }
@@ -779,8 +764,8 @@
         h(RN.Switch,{value:!!form[name],onValueChange:x=>edit(name,x)}));
       const info = (k,v) => tx(k + '：' + String(v),{fontSize:13,color:'#b6baca',marginBottom:5});
       return h(RN.ScrollView,{style:{flex:1},contentContainerStyle:{padding:18,paddingBottom:55}},
-        tx('保存到 Card v1.6（圖片來源修正版）',{fontSize:23,fontWeight:'bold'}),
-        tx('在 Discord 圖片右上角 ⋮ 選單中使用。僅在點擊按鈕時上傳。',{color:'#aeb4c8'}),
+        tx('保存到 Card v1.7（一鍵保存版）',{fontSize:23,fontWeight:'bold'}),
+        tx('點一次「保存到 Card」→ 顯示「正在保存…」→ 背後自動導入 → 成功後顯示「已保存到 Card」。',{color:'#aeb4c8'}),
         fld('server','CardVault 網址'),fld('username','CardVault 用戶名'),fld('password','CardVault 密碼',true),
         tog('allowHttp','允許 HTTP 明文連線','你的 CardVault 目前是 HTTP；帳密可能被網路截取'),
         tx('遵循 SillyTavern：優先 ccv3，回退 chara，解碼 Base64/UTF-8/JSON 驗證；只上傳原始 PNG，不轉碼。',{fontSize:12,color:'#b6baca'}),
@@ -806,7 +791,7 @@
         info('最近狀態',state.last),info('最近錯誤',state.error||'無'),
         h(RN.Pressable,{style:{backgroundColor:'#5865f2',borderRadius:10,padding:14,marginTop:20},onPress:()=>refresh(x=>x+1)},
           tx('更新診斷',{fontSize:16,fontWeight:'bold',textAlign:'center',marginBottom:0})),
-        tx('依照 SillyTavern PNG 角色卡格式驗證後，仍向既有 CardVault /api/cards/import 傳原始 PNG。圖片地址優先從選單「在瀏覽器中開啟」的動作攔截，不主動開啟瀏覽器。原生保存兜底可能另存相冊。實機仍需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
+        tx('依照 SillyTavern PNG 角色卡格式驗證後，仍向既有 CardVault /api/cards/import 傳原始 PNG。圖片地址優先使用目前檢視器；必要時攔截選單既有開啟連結。絕不呼叫原生「保存」按鈕，不另存相冊、不要求使用者再次確認。原始附件仍需由 Discord 提供；實機尚待驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
       );
     }
   };
