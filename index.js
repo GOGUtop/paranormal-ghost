@@ -3,9 +3,9 @@
   // Revenge 0980cfc > Install a plugin uses the Vendetta eval expression format.
   const v = vendetta;
   const MAX_BYTES = 30 * 1024 * 1024;
-  const MAX_CONTEXT_AGE_MS = 90 * 1000;
+  const MAX_CONTEXT_AGE_MS = 20 * 1000;
   const state = {
-    started: false, sheetHook: false, viewerHooks: [], sheets: 0, menuMatches: 0,
+    started: false, sheetHook: false, viewerHooks: [], jsxHooks: [], jsxCalls: 0, jsxMenuMatches: 0, lazyCalls: 0, sheets: 0, menuMatches: 0,
     injections: 0, clicks: 0, uploads: 0, contextUrl: '', contextAt: 0,
     last: '尚未啟動', error: '', lastUpload: ''
   };
@@ -31,8 +31,14 @@
     try { u = new URL(candidate); } catch (_) { return ''; }
     if (u.protocol !== 'https:' || !['cdn.discordapp.com', 'media.discordapp.net'].includes(u.hostname)) return '';
     if (!/^\/(?:attachments|ephemeral-attachments)\/[^?#]+\.png$/i.test(u.pathname)) return '';
-    // media.discordapp.net is a transform/proxy, never pass its bytes as a card.
-    if (u.hostname !== 'cdn.discordapp.com') return '';
+    // Discord's media proxy sometimes references the same attachment. Use CDN ORIGINAL,
+    // not resized/re-encoded proxy bytes. Preserve attachment signature fields only.
+    if (u.hostname === 'media.discordapp.net') {
+      u.hostname = 'cdn.discordapp.com';
+      for (const key of Array.from(u.searchParams.keys())) {
+        if (!['ex','is','hm'].includes(key)) u.searchParams.delete(key);
+      }
+    }
     return u.href;
   };
   const allCandidateURLs = (root, limitDepth = 5) => {
@@ -44,7 +50,7 @@
       seen.add(obj);
       if (Array.isArray(obj)) { obj.slice(0, 12).forEach(x => visit(x, depth + 1)); return; }
       for (const [key, value] of Object.entries(obj).slice(0, 40)) {
-        if (/^(url|originalUrl|originalURL|uri|source|src|image|imageUrl|media|attachment|attachments|selectedMedia|item|asset|data|props|message|viewer|images|currentItem|selectedItem|thumbnail|original)$/i.test(key)) visit(value, depth + 1);
+        if (/^(url|originalUrl|originalURL|uri|source|src|image|imageUrl|media|attachment|attachments|selectedMedia|item|asset|data|props|message|viewer|images|currentItem|selectedItem|thumbnail|original|sourceURL|sourceUri|sourceURI|originalUri|mediaUrl|mediaURL|cdnUrl|fullUrl|fullURL|originalSource|fileUrl|fileURL)$/i.test(key)) visit(value, depth + 1);
       }
     };
     visit(root, 0);
@@ -148,6 +154,195 @@
     state.injections++;
     state.last = '已插入圖片選單';
   };
+  // Additional strategy: some Discord 351.x overflow menus are rendered as
+  // React/JSX popup items, NOT by showSimpleActionSheet. Inspect freshly built
+  // element trees and only touch a sibling array resembling the image menu.
+  // This is reversible via patcher unpatch functions; nothing uploads on render.
+  const menuText = (item, depth = 0) => {
+    if (depth > 6 || item == null) return '';
+    if (typeof item === 'string') return item.trim();
+    if (typeof item !== 'object') return '';
+    for (const key of ['label','title','text','name']) {
+      if (typeof item[key] === 'string' && item[key].length < 80) return item[key].trim();
+    }
+    const p = item.props;
+    if (p && typeof p === 'object') {
+      for (const key of ['label','title','text','name']) {
+        if (typeof p[key] === 'string' && p[key].length < 80) return p[key].trim();
+      }
+      if (typeof p.children === 'string') return p.children.trim();
+      if (p.children && !Array.isArray(p.children)) return menuText(p.children, depth + 1);
+      if (Array.isArray(p.children) && p.children.length <= 8) {
+        const labels=p.children.map(c=>menuText(c,depth+1)).filter(Boolean);
+        const matches=labels.filter(x=>isSave(x)||isShare(x)||isBrowser(x));
+        if(matches.length===1)return matches[0];
+      }
+    }
+    return '';
+  };
+  const hasCallback = obj => obj && typeof obj === 'object' &&
+    ['onPress','onClick','onSelect','action','callback','onActivate'].some(k => typeof obj[k] === 'function');
+  const makeAction = (orig, handler, depth = 0) => {
+    if (!orig || typeof orig !== 'object' || depth > 5) return null;
+    const isElement = !!orig.props && typeof orig.props === 'object' && orig.type != null;
+    const props = isElement ? orig.props : orig;
+    const changed = {...props};
+    let changedLabel = false, changedHandler = false;
+    for (const key of ['label','title','text','name']) {
+      if (typeof props[key] === 'string' && isSave(props[key])) { changed[key] = '保存到 Card'; changedLabel = true; }
+    }
+    for (const key of ['onPress','onClick','onSelect','action','callback','onActivate']) {
+      if (typeof props[key] === 'function') { changed[key] = handler; changedHandler = true; }
+    }
+    if (!changedHandler && isElement && !hasCallback(props)) {
+      // Some menu items' outer component only stores the label; the callback
+      // belongs to its inner Pressable. Replace only a single-child chain.
+      if (props.children && !Array.isArray(props.children)) {
+        const child = makeAction(props.children, handler, depth+1);
+        if (child) { changed.children = child; changedHandler = true; }
+      } else if (Array.isArray(props.children) && props.children.length <= 8) {
+        for (let i=0;i<props.children.length;i++) {
+          const child = makeAction(props.children[i], handler, depth+1);
+          if (child) { changed.children = props.children.slice(); changed.children[i]=child; changedHandler = true; break; }
+        }
+      }
+    }
+    if (!changedLabel && typeof props.children === 'string' && isSave(props.children)) {
+      changed.children = '保存到 Card'; changedLabel = true;
+    }
+    if (!changedLabel && props.children && !Array.isArray(props.children)) {
+      const child = cloneLabel(props.children, depth+1);
+      if (child) { changed.children = child; changedLabel = true; }
+    }
+    if (!changedLabel && Array.isArray(props.children) && props.children.length <= 8) {
+      for(let i=0;i<props.children.length;i++) {
+        const child=cloneLabel(props.children[i],depth+1);
+        if(child){changed.children=props.children.slice();changed.children[i]=child;changedLabel=true;break;}
+      }
+    }
+    if (!changedLabel || !changedHandler) return null;
+    if ('id' in changed) changed.id = 'save-to-card-image';
+    if ('key' in changed) changed.key = 'save-to-card-image';
+    if ('disabled' in changed) changed.disabled = false;
+    if ('isDisabled' in changed) changed.isDisabled = false;
+    if (!isElement) return changed;
+    const React = v.metro?.common?.React;
+    if (typeof React?.cloneElement === 'function') {
+      try { return React.cloneElement(orig, {...changed,key:'save-to-card-image'}); } catch (_) {}
+    }
+    return {...orig,props:changed,key:'save-to-card-image'};
+  };
+  const cloneLabel = (obj, depth = 0) => {
+    if (depth > 6 || obj == null) return null;
+    if (typeof obj === 'string') return isSave(obj) ? '保存到 Card' : null;
+    if (typeof obj !== 'object') return null;
+    const props = obj.props;
+    if (!props || typeof props !== 'object') return null;
+    const p = {...props};let change = false;
+    for (const k of ['label','title','text','name']) {
+      if (typeof p[k] === 'string' && isSave(p[k])) {p[k]='保存到 Card';change=true;}
+    }
+    if (typeof p.children === 'string' && isSave(p.children)) {p.children='保存到 Card';change=true;}
+    if (!change && p.children && !Array.isArray(p.children)) {
+      const c=cloneLabel(p.children,depth+1);if(c){p.children=c;change=true;}
+    }
+    if (!change && Array.isArray(p.children) && p.children.length<=8) {
+      for(let i=0;i<p.children.length;i++){
+        const c=cloneLabel(p.children[i],depth+1);
+        if(c){p.children=p.children.slice();p.children[i]=c;change=true;break;}
+      }
+    }
+    if (!change) return null;
+    const React=v.metro?.common?.React;
+    if (typeof React?.cloneElement==='function') {
+      try {return React.cloneElement(obj,p);} catch(_){}
+    }
+    return {...obj,props:p};
+  };
+  const spliceImageMenu = (arr, context) => {
+    if (!Array.isArray(arr) || arr.length < 3 || arr.length > 18) return null;
+    const labels=arr.map(menuText);
+    if (!labels.some(isSave) || !labels.some(isShare) || !labels.some(isBrowser)) return null;
+    if (labels.includes('保存到 Card')) return null;
+    state.jsxMenuMatches++;
+    const pos=labels.findIndex(isSave), original=arr[pos];
+    // First render the action even when image URL isn't available. On click,
+    // show the error rather than silently uploading another image.
+    const action=makeAction(original,()=>downloadAndUpload(currentURL(context)));
+    if (!action) { state.last='找到圖片選單，但無法安全複製保存項目';return null; }
+    const result=arr.slice();result.splice(pos+1,0,action);
+    state.injections++;
+    state.last='JSX 圖片選單已插入保存到 Card';
+    return result;
+  };
+  const menuFields = ['options','items','actions','menuItems','menuOptions','actionItems','children','rows'];
+  const transformMenu = (props, depth = 0) => {
+    if (!props || typeof props!=='object' || depth > 2) return null;
+    let next=null;
+    for(const key of menuFields) {
+      if (!Array.isArray(props[key])) continue;
+      const patched=spliceImageMenu(props[key],props);
+      if(patched){next=next||{...props};next[key]=patched;break;}
+    }
+    if(next)return next;
+    if(depth<2){for(const key of ['menu','data','menuData','content','config']){
+      if(!props[key] || Array.isArray(props[key]) || typeof props[key]!=='object') continue;
+      const nested=transformMenu(props[key],depth+1);
+      if(nested){return {...props,[key]:nested};}
+    }}
+    return null;
+  };
+  const inspectElement = element => {
+    state.jsxCalls++;
+    if(!element || typeof element!=='object' || !element.props)return element;
+    const changed=transformMenu(element.props);
+    if(!changed)return element;
+    const React=v.metro?.common?.React;
+    if(typeof React?.cloneElement==='function'){
+      try{return React.cloneElement(element,changed);}catch(_){}
+    }
+    return {...element,props:changed};
+  };
+  const patchAfter = (method, mod, cb, label) => {
+    if(!mod || typeof mod[method]!=='function' || typeof v.patcher?.after!=='function')return false;
+    try {const unpatch=v.patcher.after(method,mod,cb);
+      if(typeof unpatch!=='function')return false;
+      cleanups.push(unpatch);state.jsxHooks.push(label);return true;
+    }catch(e){reportError(e);return false;}
+  };
+  const installJSXHooks = () => {
+    // React.createElement and automatic JSX runtime are distinct factory paths.
+    // Patch both to cover different Discord bundles without relying on guessed
+    // image-menu component names.
+    const React=v.metro?.common?.React;
+    patchAfter('createElement',React,(args,result)=>inspectElement(result),'React.createElement');
+    const names=[['jsx','jsxs'],['jsx','jsxs','Fragment'],['jsxDEV']];
+    const modules=[];
+    for(const keys of names){
+      try {const m=v.metro?.findByProps?.(...keys);
+        if(m && !modules.includes(m))modules.push(m);
+      }catch(_){}
+    }
+    for(const m of modules){
+      for(const method of ['jsx','jsxs','jsxDEV']){
+        if(typeof m[method]==='function')patchAfter(method,m,(args,result)=>inspectElement(result),'JSX.'+method);
+      }
+    }
+    // Popup opening gives diagnostics even if props aren't rendered through
+    // the factories we can intercept. NEVER suppress the original popup.
+    try {const m=v.metro?.findByProps?.('openLazy');
+      if(m && typeof m.openLazy==='function') {
+        const off=v.patcher.before('openLazy',m,args=>{
+          state.lazyCalls++;
+          for(const x of args||[]){if(x && typeof x==='object'){
+            const changed=transformMenu(x);
+            if(changed) {try{Object.assign(x,changed);}catch(e){reportError(e);}}
+          }}
+        });
+        if(typeof off==='function'){cleanups.push(off);state.jsxHooks.push('ActionSheet.openLazy');}
+      }
+    }catch(e){reportError(e);}
+  };
   const patchMethod = (method, matcher, callback) => {
     try {
       const m = v.metro?.findByProps?.(method);
@@ -171,11 +366,12 @@
       state.started = true;
       state.last = '插件已啟動';
       state.sheetHook = patchMethod('showSimpleActionSheet', null, inspectSheet);
+      installJSXHooks();
       const mediaMethodNames = ['openMediaModal', 'openMediaViewer', 'openImageViewer', 'openMediaCarousel', 'openImageModal'];
       for (const method of mediaMethodNames) {
         if (patchMethod(method, null, rememberViewerContext)) state.viewerHooks.push(method);
       }
-      toast(state.sheetHook ? '保存到 Card 已啟動（圖片選單待測）' : '保存到 Card 已載入：尚未定位選單介面');
+      toast('保存到 Card 已啟動，JSX Hooks: ' + state.jsxHooks.length);
     },
     onUnload() {
       while (cleanups.length) { try { cleanups.pop()(); } catch (e) { logger(e); } }
@@ -206,13 +402,15 @@
         tx('執行狀態',{fontSize:18,fontWeight:'bold',marginTop:14}),
         info('已啟動',state.started?'是':'否'),info('圖片選單 Hook',state.sheetHook?'是':'否'),
         info('圖片檢視器 Hook',state.viewerHooks.join(', ')||'未找到'),
+        info('React/JSX 鉤子',state.jsxHooks.join(', ')||'未找到'),info('JSX 執行次數',state.jsxCalls),
+        info('JSX 圖片選單命中',state.jsxMenuMatches),info('openLazy 呼叫',state.lazyCalls),
         info('ActionSheet 呼叫',state.sheets),info('圖片選單命中',state.menuMatches),
         info('插入次數',state.injections),info('按鈕點擊',state.clicks),info('成功上傳',state.uploads),
         info('目前圖片 PNG URL',state.contextUrl?'已捕獲':'尚未捕獲'),
         info('最近狀態',state.last),info('最近錯誤',state.error||'無'),
         h(RN.Pressable,{style:{backgroundColor:'#5865f2',borderRadius:10,padding:14,marginTop:20},onPress:()=>refresh(x=>x+1)},
           tx('更新診斷',{fontSize:16,fontWeight:'bold',textAlign:'center',marginBottom:0})),
-        tx('注意：這是根據公開 Revenge API 構建的版本，Discord 351.11 圖片選單及原圖取得尚未經你的手機驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
+        tx('注意：圖片選單新增 React/JSX 攔截，實機菜單位置仍需驗證；若網址不可得，點擊不會上傳。',{fontSize:12,color:'#b6baca',marginTop:18})
       );
     }
   };
