@@ -3,7 +3,7 @@
   // Revenge 0980cfc > Install a plugin uses the Vendetta eval expression format.
   const v = vendetta;
   const MAX_BYTES = 30 * 1024 * 1024;
-  const MAX_CONTEXT_AGE_MS = 20 * 1000;
+  const MAX_CONTEXT_AGE_MS = 60 * 1000;
   const state = {
     started: false, sheetHook: false, viewerHooks: [], jsxHooks: [], jsxCalls: 0, jsxMenuMatches: 0, lazyCalls: 0, sheets: 0, menuMatches: 0,
     renderMediaHooks: [], renderMediaCalls: 0, renderMediaURLs: 0, renderMediaAmbiguous: false, mediaType: '', sourceReason: '',
@@ -11,7 +11,7 @@
     last: '尚未啟動', error: '', lastUpload: ''
   };
   const cleanups = [];
-  const config = {server: 'http://aaa.xixisillytavern.top:8788', username: '', password: '', allowHttp: false, onlyCard: true};
+  const config = {server: 'http://aaa.xixisillytavern.top:8788', username: '', password: '', allowHttp: false, onlyCard: false};
   let busy = false;
   const text = x => String(x == null ? '' : x).slice(0, 300);
   const logger = s => { try { v.logger?.log?.('[SaveToCard] ' + text(s)); } catch (_) {} };
@@ -20,27 +20,82 @@
   for (const k of Object.keys(config)) {
     if (store && typeof store[k] === typeof config[k]) config[k] = store[k];
   }
+  // The user requested no PNG/card prerequisite. Override persisted strict filter.
+  config.onlyCard = false;
+  if (store) { try { store.onlyCard = false; } catch (_) {} }
   const saveConfig = (key, value) => {
     if (!Object.prototype.hasOwnProperty.call(config, key)) return;
     config[key] = value;
     if (store) { try { store[key] = value; } catch (e) { state.error = '保存設定失敗: ' + text(e); } }
   };
   const reportError = e => { state.error = text(e && e.message ? e.message : e); logger(state.error); };
+  // Accept the current Discord image as-is: PNG, JPEG, WebP, GIF or AVIF.
+  // A picture still needs a source to transfer bytes; no filename restriction.
   const fileURL = candidate => {
-    if (typeof candidate !== 'string' || candidate.length > 3000) return '';
-    let u;
-    try { u = new URL(candidate); } catch (_) { return ''; }
-    if (u.protocol !== 'https:' || !['cdn.discordapp.com', 'media.discordapp.net'].includes(u.hostname)) return '';
-    if (!/^\/(?:attachments|ephemeral-attachments)\/[^?#]+\.png$/i.test(u.pathname)) return '';
-    // Discord's media proxy sometimes references the same attachment. Use CDN ORIGINAL,
-    // not resized/re-encoded proxy bytes. Preserve attachment signature fields only.
-    if (u.hostname === 'media.discordapp.net') {
-      u.hostname = 'cdn.discordapp.com';
-      for (const key of Array.from(u.searchParams.keys())) {
-        if (!['ex','is','hm'].includes(key)) u.searchParams.delete(key);
-      }
+    const rec = mediaRecord(candidate);
+    return rec ? rec.url : '';
+  };
+  const mimeOf = bytes => {
+    if (bytes.length >= 8 && bytes[0]===137 && bytes[1]===80 && bytes[2]===78 && bytes[3]===71 && bytes[4]===13 && bytes[5]===10) return 'image/png';
+    if (bytes.length >= 3 && bytes[0]===255 && bytes[1]===216 && bytes[2]===255) return 'image/jpeg';
+    if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0,4))==='RIFF' && String.fromCharCode(...bytes.slice(8,12))==='WEBP') return 'image/webp';
+    if (bytes.length >= 6 && String.fromCharCode(...bytes.slice(0,3))==='GIF') return 'image/gif';
+    if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(4,8))==='ftyp' && /avif|avis/.test(String.fromCharCode(...bytes.slice(8,12)))) return 'image/avif';
+    throw Error('下載的檔案不是可辨識的圖片');
+  };
+  // Native Save fallback: ask Discord's own Save action for the attachment,
+  // observe its MediaManager.downloadMediaAsset call, then transfer those bytes.
+  let waitingSave = null;
+  const nativeDownload = {hook:false,captures:0};
+  const installSaveCapture = () => {
+    const names=['downloadMediaAsset','downloadMedia','saveMediaAsset'];
+    for(const method of names){
+      let module;
+      try {module=v.metro?.findByProps?.(method);} catch (_) {}
+      if(!module || typeof module[method]!=='function') continue;
+      try {
+        const off=v.patcher?.before?.(method,module,args=>{
+          if(!waitingSave) return;
+          const candidates=mediaRecords(args,6);
+          if(candidates.length!==1) return;
+          nativeDownload.captures++;
+          const current=waitingSave;
+          waitingSave=null;
+          current.resolve(candidates[0].url);
+        });
+        if(typeof off==='function'){cleanups.push(off);nativeDownload.hook=true;}
+      } catch(e){reportError(e);}
     }
-    return u.href;
+  };
+  const originalAction = (obj,depth=0) => {
+    if(!obj || depth>6 || typeof obj!=='object') return null;
+    const p=obj.props && typeof obj.props==='object' ? obj.props : obj;
+    for (const k of ['onPress','onClick','onSelect','action','callback','onActivate']) {
+      if(typeof p[k]==='function') return {fn:p[k], receiver:p};
+    }
+    if(Array.isArray(p.children)) {
+      for(const child of p.children){const found=originalAction(child,depth+1);if(found)return found;}
+    } else if(p.children) return originalAction(p.children,depth+1);
+    return null;
+  };
+  const uploadFromSaveAction = async (context, nativeSave) => {
+    const direct=currentURL(context);
+    if(direct) return downloadAndUpload(direct);
+    if(!nativeSave || typeof nativeSave.fn!=='function') return downloadAndUpload('');
+    if(waitingSave) return toast('另一張圖片正在等待來源，請稍後');
+    toast('正在使用 Discord 原生保存取得圖片來源…');
+    const url=await new Promise(resolve=>{
+      const pending={resolve};waitingSave=pending;
+      const finish=()=>{if(waitingSave===pending){waitingSave=null;resolve('');}};
+      try {
+        const result=nativeSave.fn.call(nativeSave.receiver);
+        if(result && typeof result.catch==='function') result.catch(reportError);
+      }catch(e){reportError(e);finish();return;}
+      setTimeout(finish,1800);
+    });
+    if(!url){state.sourceReason='原生保存沒有提供可讀取的媒體地址';return downloadAndUpload('');}
+    state.sourceReason='Discord 原生保存攔截';
+    return downloadAndUpload(url);
   };
   // Inspect the *current full-screen viewer* instead of assuming that a popup
   // contains attachment metadata. A renderer may receive a proxy image URI in
@@ -95,7 +150,7 @@
     state.viewerSources = [...urls].slice(0,12);
     state.renderMediaAmbiguous = state.viewerSources.length > 1;
     const single = state.viewerSources.length === 1 ? mediaRecord(state.viewerSources[0]) : null;
-    state.renderMediaURL = single && single.png ? single.url : '';
+    state.renderMediaURL = single ? single.url : '';
     state.mediaType = single ? single.extension.toUpperCase() : (state.renderMediaAmbiguous ? '多張圖片，來源不唯一' : '');
     state.sourceReason = from + '：' + (state.renderMediaAmbiguous ? '多張來源' : (single ? single.extension : '找不到來源'));
   };
@@ -154,7 +209,7 @@
     if (explicit.length === 1) {
       state.mediaType=explicit[0].extension.toUpperCase();
       state.sourceReason='選單附件';
-      return explicit[0].png ? explicit[0].url : '';
+      return explicit[0].url;
     }
     // openMediaModal often has only navigation flags; its payload, when
     // available, is more specific than a broad message-attachment scan.
@@ -195,31 +250,31 @@
     state.clicks++;
     busy = true;
     try {
-      if (!url) throw Error(state.renderMediaAmbiguous ? '查看器有多個來源，無法確定目前圖片，已取消上傳' : (state.mediaType && state.mediaType !== 'PNG' ? ('當前附件格式是 '+state.mediaType+'，不是原始 PNG 角色卡，已取消上傳') : '尚未取得當前圖片的原始 PNG 地址，已取消上傳'));
+      if (!url) throw Error(state.renderMediaAmbiguous ? '查看器有多個來源，無法確定目前圖片，已取消上傳' : '尚未取得目前圖片的來源，也未能從 Discord 原生保存取得地址');
       const src = fileURL(url);
-      if (!src) throw Error('目前只能上傳 Discord CDN 的原始 PNG 附件');
+      if (!src) throw Error('無法取得 Discord 圖片來源（可能是嵌入圖片或外部地址）');
       if (!config.username || !config.password) throw Error('請先在插件設定中輸入 CardVault 帳號密碼');
       const base = serverBase();
-      toast('正在下載 PNG 原檔…');
+      toast('正在取得目前圖片…');
       const download = await fetch(src);
       if (!download.ok) throw Error('下載失敗 HTTP ' + download.status);
       const declared = Number(download.headers?.get?.('content-length') || 0);
-      if (declared > MAX_BYTES) throw Error('原始 PNG 超過 30 MB');
+      if (declared > MAX_BYTES) throw Error('圖片超過 30 MB');
       const raw = await download.arrayBuffer();
-      if (raw.byteLength > MAX_BYTES) throw Error('原始 PNG 超過 30 MB');
+      if (raw.byteLength > MAX_BYTES) throw Error('圖片超過 30 MB');
       const bytes = new Uint8Array(raw);
-      if (config.onlyCard && !pngHasMetadata(bytes)) throw Error('沒有 chara 或 ccv3 中繼資料，未上傳');
-      if (!config.onlyCard) pngHasMetadata(bytes); // verify PNG even in non-card mode
+      const mime = mimeOf(bytes);
+      if (config.onlyCard && (mime !== 'image/png' || !pngHasMetadata(bytes))) throw Error('開啟了只導入角色卡，但此圖片不是含 chara/ccv3 的 PNG');
       toast('登入 CardVault…');
       const login = await fetch(base + '/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username:config.username,password:config.password})});
       if (!login.ok) throw Error('登入失敗 HTTP ' + login.status);
       const json = await login.json();
       const token = json?.token || json?.data?.token;
       if (typeof token !== 'string' || !token) throw Error('登入結果未提供 token');
-      const filename = (decodeURIComponent(new URL(src).pathname.split('/').pop() || 'discord-card.png')).replace(/[\r\n\\]/g,'_').slice(0,180);
+      const filename = (decodeURIComponent(new URL(src).pathname.split('/').pop() || 'discord-image')).replace(/[\r\n\\]/g,'_').slice(0,180);
       toast('上傳到 CardVault…');
-      const response = await fetch(base + '/api/cards/import', { method:'POST',headers:{'Content-Type':'image/png','Authorization':'Bearer '+token,'X-File-Name':filename},body:raw });
-      if (!response.ok) throw Error('上傳失敗 HTTP ' + response.status + ': ' + (await response.text()).slice(0,100));
+      const response = await fetch(base + '/api/cards/import', { method:'POST',headers:{'Content-Type':mime,'Authorization':'Bearer '+token,'X-File-Name':filename},body:raw });
+      if (!response.ok) throw Error('CardVault 拒絕這張圖片 HTTP '+response.status+'（網站可能只接受角色卡 PNG）：'+(await response.text()).slice(0,100));
       state.uploads++;
       state.lastUpload = filename;
       toast('已保存到 Card：' + filename);
@@ -246,7 +301,8 @@
     if (pos < 0) return;
     // Always display the action in the recognized image menu. Determine URL at press time.
     const original = sheet.options[pos];
-    const item = { label:'保存到 Card', onPress: () => downloadAndUpload(currentURL(sheet)) };
+    const save = originalAction(original);
+    const item = { label:'保存到 Card', onPress: () => uploadFromSaveAction(sheet,save) };
     if (original && original.icon != null) item.icon = original.icon;
     const options = sheet.options.slice();
     options.splice(pos + 1, 0, item);
@@ -368,7 +424,8 @@
     const pos=labels.findIndex(isSave), original=arr[pos];
     // First render the action even when image URL isn't available. On click,
     // show the error rather than silently uploading another image.
-    const action=makeAction(original,()=>downloadAndUpload(currentURL(context)));
+    const save=originalAction(original);
+    const action=makeAction(original,()=>uploadFromSaveAction(context,save));
     if (!action) { state.last='找到圖片選單，但無法安全複製保存項目';return null; }
     const result=arr.slice();result.splice(pos+1,0,action);
     state.injections++;
@@ -458,7 +515,7 @@
     state.mediaType='';state.sourceReason='查看器已開啟，等待媒體來源';
     if (!args || !Array.isArray(args)) return;
     const records = mediaRecords(args,8);
-    state.contextUrl = records.length===1 && records[0].png ? records[0].url : '';
+    state.contextUrl = records.length===1 ? records[0].url : '';
     state.contextAt = state.contextUrl ? Date.now() : 0;
     if (records.length===1) {state.mediaType=records[0].extension.toUpperCase();state.sourceReason='openMediaModal 參數';}
     else if (records.length>1) {state.sourceReason='openMediaModal 多張候選附件';}
@@ -471,6 +528,7 @@
       state.sheetHook = patchMethod('showSimpleActionSheet', null, inspectSheet);
       installJSXHooks();
       installRenderMediaHooks();
+      installSaveCapture();
       const mediaMethodNames = ['openMediaModal', 'openMediaViewer', 'openImageViewer', 'openMediaCarousel', 'openImageModal'];
       for (const method of mediaMethodNames) {
         if (patchMethod(method, null, rememberViewerContext)) state.viewerHooks.push(method);
@@ -480,7 +538,7 @@
     onUnload() {
       while (cleanups.length) { try { cleanups.pop()(); } catch (e) { logger(e); } }
       state.started = false;
-      state.contextUrl = '';state.renderMediaURL='';state.viewerSources=[];
+      state.contextUrl = '';state.renderMediaURL='';state.viewerSources=[];waitingSave=null;
     },
     settings: function SaveToCardSettings() {
       const React = v.metro?.common?.React, RN = v.metro?.common?.ReactNative;
@@ -498,27 +556,29 @@
         h(RN.Switch,{value:!!form[name],onValueChange:x=>edit(name,x)}));
       const info = (k,v) => tx(k + '：' + String(v),{fontSize:13,color:'#b6baca',marginBottom:5});
       return h(RN.ScrollView,{style:{flex:1},contentContainerStyle:{padding:18,paddingBottom:55}},
-        tx('保存到 Card v1.2',{fontSize:23,fontWeight:'bold'}),
+        tx('保存到 Card v1.3',{fontSize:23,fontWeight:'bold'}),
         tx('在 Discord 圖片右上角 ⋮ 選單中使用。僅在點擊按鈕時上傳。',{color:'#aeb4c8'}),
         fld('server','CardVault 網址'),fld('username','CardVault 用戶名'),fld('password','CardVault 密碼',true),
-        tog('onlyCard','只導入角色卡','檢查 PNG chara / ccv3 中繼資料'),
         tog('allowHttp','允許 HTTP 明文連線','你的 CardVault 目前是 HTTP；帳密可能被網路截取'),
+        tx('圖片會直接傳到 CardVault；不檢查 PNG 或角色卡。網站可能拒絕非角色卡圖片。',{fontSize:12,color:'#b6baca'}),
         tx('執行狀態',{fontSize:18,fontWeight:'bold',marginTop:14}),
         info('已啟動',state.started?'是':'否'),info('圖片選單 Hook',state.sheetHook?'是':'否'),
         info('圖片檢視器 Hook',state.viewerHooks.join(', ')||'未找到'),
         info('renderMedia 鉤子',state.renderMediaHooks.join(', ')||'未找到'),
         info('renderMedia 呼叫',state.renderMediaCalls),
+        info('Discord 原生保存 Hook',nativeDownload.hook?'是':'否'),
+        info('原生保存捕獲',nativeDownload.captures),
         info('目前來源類型',state.mediaType||'未知'),
         info('來源辨識',state.sourceReason||'尚未檢查'),
         info('React/JSX 鉤子',state.jsxHooks.join(', ')||'未找到'),info('JSX 執行次數',state.jsxCalls),
         info('JSX 圖片選單命中',state.jsxMenuMatches),info('openLazy 呼叫',state.lazyCalls),
         info('ActionSheet 呼叫',state.sheets),info('圖片選單命中',state.menuMatches),
         info('插入次數',state.injections),info('按鈕點擊',state.clicks),info('成功上傳',state.uploads),
-        info('目前圖片 PNG URL',(state.contextUrl||state.renderMediaURL)?'已捕獲':'尚未捕獲'),
+        info('目前圖片 URL',(state.contextUrl||state.renderMediaURL)?'已捕獲':'尚未捕獲'),
         info('最近狀態',state.last),info('最近錯誤',state.error||'無'),
         h(RN.Pressable,{style:{backgroundColor:'#5865f2',borderRadius:10,padding:14,marginTop:20},onPress:()=>refresh(x=>x+1)},
           tx('更新診斷',{fontSize:16,fontWeight:'bold',textAlign:'center',marginBottom:0})),
-        tx('注意：新增加 renderMedia 來源辨識。遇到多張圖片或非 PNG 附件會拒絕上傳；實機需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
+        tx('本版不要求 PNG 後綴；若無來源，嘗試調用 Discord 原生保存，可能同時保存到相冊。CardVault 是否接受普通 JPG 由網站決定。實機需驗證。',{fontSize:12,color:'#b6baca',marginTop:18})
       );
     }
   };

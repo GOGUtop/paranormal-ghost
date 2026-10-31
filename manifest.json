@@ -1,12 +1,12 @@
 {
-  "name": "保存到 Card（原始 PNG 辨識 v1.2）",
-  "description": "修復圖片選單點擊後缺少原始 PNG 地址：增加全屏查看器 renderMedia 來源檢測，保留角色卡檢測與 CardVault 上傳。",
+  "name": "保存到 Card（直接保存圖片 v1.3）",
+  "description": "移除 PNG 前置限制；使用目前圖片，缺少地址時可嘗試借用 Discord 原生保存動作；CardVault 導入能力仍由網站決定。",
   "authors": [
     {
       "name": "CardVault integration"
     }
   ],
   "main": "index.js",
-  "version": "1.2.0",
-  "hash": "bcbebdd3df3660f11eca52f468039a09f98e77ea55b9b65c5944a0268a99c194"
+  "version": "1.3.0",
+  "hash": "63782769bc0b396f45ec5b2e956a6ad9facaa07bf15253f30a56d8b1fecc7cb4"
 }
